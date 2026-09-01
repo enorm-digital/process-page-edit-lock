@@ -1,0 +1,688 @@
+<?php namespace ProcessWire;
+
+/**
+ * PageEditLock
+ *
+ * Temporary concurrent page editing lock for ProcessWire 3.x.
+ *
+ * @author Custom module
+ * @version 1.0.0
+ * @license MIT
+ */
+class PageEditLock extends WireData implements Module, ConfigurableModule {
+
+    const VERSION = '1.2.0';
+    const TABLE = 'page_edit_lock';
+
+    public static function getModuleInfo() {
+        return [
+            'title' => 'Page Edit Lock',
+            'version' => self::VERSION,
+            'summary' => 'Temporarily locks pages while they are being edited and prevents stale editors from overwriting newer changes.',
+            'author' => 'ENORM',
+            'autoload' => true,
+            'singular' => true,
+            'requires' => 'ProcessWire>=3.0.253',
+        ];
+    }
+
+    public function init() {
+        $this->addHookAfter('ProcessPageEdit::buildFormContent', $this, 'hookBuildFormContent');
+        $this->addHookBefore('ProcessPageEdit::execute', $this, 'hookExecute');
+        $this->addHookBefore('ProcessPageEdit::ajaxSave', $this, 'hookAjaxSave');
+        $this->addHookBefore('ProcessPageEdit::processSubmitAction', $this, 'hookProcessSubmitAction');
+        $this->addHookBefore('Page::saveReady', $this, 'hookPageSaveReady');
+        $this->addHookAfter('Page::saved', $this, 'hookPageSaved');
+
+        // Remove stale locks opportunistically, piggybacking on other admin ajax
+        // requests. Skip this on our own PageEditLock requests since acquireLock()
+        // already runs cleanupStaleLocks() itself for those.
+        if($this->config->ajax && !$this->ajaxRequest()) {
+            $this->cleanupStaleLocks();
+        }
+    }
+
+    public function ___install() {
+        $this->createTable();
+    }
+
+    public function ___uninstall() {
+        $this->wire('database')->exec("DROP TABLE IF EXISTS `" . self::TABLE . "`");
+    }
+
+    public function getModuleConfigInputfields($inputfields) {
+        $modules = $this->wire('modules');
+
+        $f = $modules->get('InputfieldInteger');
+        $f->attr('name', 'timeout');
+        $f->label = 'Lock timeout (seconds)';
+        $f->description = 'After this period without a successful heartbeat, the lock is considered expired.';
+        $f->value = (int) $this->get('timeout', 120);
+        $f->min = 30;
+        $f->max = 86400;
+        $inputfields->add($f);
+
+        $f = $modules->get('InputfieldInteger');
+        $f->attr('name', 'heartbeat');
+        $f->label = 'Heartbeat interval (seconds)';
+        $f->description = 'How often an active editor tells the server that the lock is still in use.';
+        $f->value = (int) $this->get('heartbeat', 20);
+        $f->min = 5;
+        $f->max = 300;
+        $inputfields->add($f);
+
+        $f = $modules->get('InputfieldAsmSelect');
+        $f->attr('name', 'excludeTemplates');
+        $f->label = 'Exclude templates';
+        $f->description = 'Pages using these templates will not be locked. Leave empty to protect all editable pages.';
+        $f->options = [];
+        foreach($this->wire('templates') as $template) {
+            $f->addOption($template->id, $template->name);
+        }
+        $f->value = $this->get('excludeTemplates', []);
+        $inputfields->add($f);
+
+        $f = $modules->get('InputfieldCheckbox');
+        $f->attr('name', 'adminsCanOverride');
+        $f->label = 'Allow superusers to override an active lock';
+        $f->description = 'Superusers can take over a page that is currently locked by another client.';
+        $f->checked = (bool) $this->get('adminsCanOverride', false);
+        $inputfields->add($f);
+
+        return $inputfields;
+    }
+
+    protected function createTable() {
+        $db = $this->wire('database');
+        $table = self::TABLE;
+        $db->exec("
+            CREATE TABLE IF NOT EXISTS `$table` (
+                `id` int unsigned NOT NULL AUTO_INCREMENT,
+                `page_id` int unsigned NOT NULL,
+                `user_id` int unsigned NOT NULL,
+                `client_id` varchar(64) NOT NULL,
+                `last_seen` datetime NOT NULL,
+                `created` datetime NOT NULL,
+                `base_modified` datetime NULL,
+                PRIMARY KEY (`id`),
+                UNIQUE KEY `page_id` (`page_id`),
+                KEY `last_seen` (`last_seen`),
+                KEY `user_id` (`user_id`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        ");
+    }
+
+    public function upgrade($fromVersion, $toVersion = null) {
+        if(!$this->tableExists()) {
+            $this->createTable();
+            return;
+        }
+        $db = $this->wire('database');
+        try {
+            $db->exec("ALTER TABLE `" . self::TABLE . "` ADD COLUMN `base_modified` datetime NULL AFTER `created`");
+        } catch(\Throwable $e) {
+            // Column already exists.
+        }
+    }
+
+    protected function tableExists() {
+        try {
+            $this->wire('database')->query("SELECT 1 FROM `" . self::TABLE . "` LIMIT 1");
+            return true;
+        } catch(\Throwable $e) {
+            return false;
+        }
+    }
+
+    protected function isEnabledForPage(Page $page) {
+        if(!$page->id || $page->isTrash()) return false;
+        if(!$this->wire('user')->isLoggedin()) return false;
+        if(!$this->wire('process') instanceof ProcessPageEdit) return false;
+
+        $excluded = $this->get('excludeTemplates', []);
+        if(is_string($excluded)) $excluded = array_filter(explode(',', $excluded));
+        if(in_array((string)$page->template->id, array_map('strval', (array)$excluded), true)) return false;
+        if(in_array($page->template->name, (array)$excluded, true)) return false;
+
+        return true;
+    }
+
+    protected function clientId() {
+        // The browser supplies the actual per-client ID. We never use the PW session
+        // ID as the sole identifier because two browsers may share the same account.
+        $id = trim((string) $this->wire('input')->post('client_id'));
+        if(!$id) $id = trim((string) $this->wire('input')->get('client_id'));
+        if(!preg_match('/^[a-f0-9]{32}$/', $id)) return '';
+        return $id;
+    }
+
+    protected function getPageFromEditProcess() {
+        $process = $this->wire('process');
+        if(!$process instanceof ProcessPageEdit) return null;
+        try {
+            $page = $process->getPage();
+            return $page instanceof Page ? $page : null;
+        } catch(\Throwable $e) {
+            return null;
+        }
+    }
+
+    protected function cleanupStaleLocks() {
+        if(!$this->tableExists()) return;
+        $seconds = max(30, (int)$this->get('timeout', 120));
+        $this->wire('database')->exec(
+            "DELETE FROM `" . self::TABLE . "` WHERE `last_seen` < DATE_SUB(NOW(), INTERVAL " . (int)$seconds . " SECOND)"
+        );
+    }
+
+    protected function lockForPage($pageId) {
+        $stmt = $this->wire('database')->prepare(
+            "SELECT * FROM `" . self::TABLE . "` WHERE page_id = :page_id LIMIT 1"
+        );
+        $stmt->execute([':page_id' => (int)$pageId]);
+        $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+        if(!$row) return null;
+
+        $timeout = max(30, (int)$this->get('timeout', 120));
+        if(strtotime($row['last_seen']) < time() - $timeout) {
+            $del = $this->wire('database')->prepare("DELETE FROM `" . self::TABLE . "` WHERE id = :id");
+            $del->execute([':id' => (int)$row['id']]);
+            return null;
+        }
+
+        // ProcessWire users are Page objects (in the `pages` table), not rows in a
+        // separate `users` table, so the username has to be resolved via the API.
+        $user = $this->wire('users')->get((int)$row['user_id']);
+        $row['user_name'] = ($user && $user->id) ? $user->name : null;
+
+        return $row;
+    }
+
+    protected function ownLock($pageId, $clientId = '') {
+        if(!$clientId) $clientId = $this->clientId();
+        if(!$clientId) return false;
+        $row = $this->lockForPage($pageId);
+        return $row && (int)$row['user_id'] === (int)$this->wire('user')->id && hash_equals($row['client_id'], $clientId);
+    }
+
+    /**
+     * Atomically acquire a lock. A stale lock is first removed. The unique page_id
+     * constraint makes simultaneous acquisitions safe at the database level.
+     */
+    protected function acquireLock(Page $page, $clientId) {
+        $this->cleanupStaleLocks();
+        $db = $this->wire('database');
+        $existing = $this->lockForPage($page->id);
+
+        if($existing) {
+            $same = (int)$existing['user_id'] === (int)$this->wire('user')->id
+                && hash_equals($existing['client_id'], $clientId);
+
+            if($same) {
+                $stmt = $db->prepare("UPDATE `" . self::TABLE . "` SET last_seen = NOW() WHERE id = :id");
+                $stmt->execute([':id' => (int)$existing['id']]);
+                return ['ok' => true, 'owner' => true, 'row' => $existing];
+            }
+
+            if($this->get('adminsCanOverride', false) && $this->wire('user')->isSuperuser()) {
+                $this->forceReleaseLock($page->id);
+            } else {
+                return ['ok' => false, 'owner' => false, 'row' => $existing];
+            }
+        }
+
+        try {
+            $stmt = $db->prepare(
+                "INSERT INTO `" . self::TABLE . "` (page_id, user_id, client_id, last_seen, created, base_modified)
+                 VALUES (:page_id, :user_id, :client_id, NOW(), NOW(), :base_modified)"
+            );
+            $stmt->execute([
+                ':page_id' => (int)$page->id,
+                ':user_id' => (int)$this->wire('user')->id,
+                ':client_id' => $clientId,
+                ':base_modified' => $page->modified ?: null,
+            ]);
+        } catch(\PDOException $e) {
+            // Another request won the race. Read the winner and report it.
+            $winner = $this->lockForPage($page->id);
+            return ['ok' => false, 'owner' => false, 'row' => $winner];
+        }
+
+        return ['ok' => true, 'owner' => true, 'row' => $this->lockForPage($page->id)];
+    }
+
+    protected function heartbeat(Page $page, $clientId) {
+        $stmt = $this->wire('database')->prepare(
+            "UPDATE `" . self::TABLE . "`
+             SET last_seen = NOW()
+             WHERE page_id = :page_id AND user_id = :user_id AND client_id = :client_id"
+        );
+        $stmt->execute([
+            ':page_id' => (int)$page->id,
+            ':user_id' => (int)$this->wire('user')->id,
+            ':client_id' => $clientId,
+        ]);
+
+        if($stmt->rowCount() === 0) {
+            return $this->acquireLock($page, $clientId);
+        }
+
+        return ['ok' => true, 'owner' => true, 'row' => $this->lockForPage($page->id)];
+    }
+
+    protected function releaseLock($pageId, $clientId = '') {
+        $clientId = $clientId ?: $this->clientId();
+        if(!$clientId) return false;
+
+        $stmt = $this->wire('database')->prepare(
+            "DELETE FROM `" . self::TABLE . "`
+             WHERE page_id = :page_id AND user_id = :user_id AND client_id = :client_id"
+        );
+        return $stmt->execute([
+            ':page_id' => (int)$pageId,
+            ':user_id' => (int)$this->wire('user')->id,
+            ':client_id' => $clientId,
+        ]);
+    }
+
+    /**
+     * Delete a lock regardless of who owns it. Only ever called after the caller
+     * has already verified adminsCanOverride + isSuperuser().
+     */
+    protected function forceReleaseLock($pageId) {
+        $stmt = $this->wire('database')->prepare("DELETE FROM `" . self::TABLE . "` WHERE page_id = :page_id");
+        return $stmt->execute([':page_id' => (int)$pageId]);
+    }
+
+    protected function json($data, $status = 200) {
+        http_response_code($status);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    }
+
+    protected function ajaxRequest() {
+        return $this->wire('input')->get('PageEditLock') === '1'
+            || $this->wire('input')->post('PageEditLock') === '1';
+    }
+
+    protected function ajaxEndpoint() {
+        $input = $this->wire('input');
+        $action = trim((string)$input->post('action'));
+        if(!$action) $action = trim((string)$input->get('action'));
+
+        if(!$this->wire('user')->isLoggedin()) {
+            $this->json(['ok' => false, 'error' => 'not_logged_in'], 403);
+            exit;
+        }
+
+        $pageId = (int)$input->post('page_id');
+        if(!$pageId) $pageId = (int)$input->get('page_id');
+        $page = $this->wire('pages')->get($pageId);
+
+        if(!$page->id || !$page->editable()) {
+            $this->json(['ok' => false, 'error' => 'page_not_editable'], 403);
+            exit;
+        }
+
+        if(!$this->isEnabledForPage($page)) {
+            $this->json(['ok' => true, 'disabled' => true]);
+            exit;
+        }
+
+        $clientId = $this->clientId();
+        if(!$clientId) {
+            $this->json(['ok' => false, 'error' => 'invalid_client_id'], 400);
+            exit;
+        }
+
+        try {
+            switch($action) {
+                case 'claim':
+                    $result = $this->acquireLock($page, $clientId);
+                    $this->json($this->resultPayload($result));
+                    break;
+
+                case 'heartbeat':
+                    $result = $this->heartbeat($page, $clientId);
+                    $this->json($this->resultPayload($result));
+                    break;
+
+                case 'release':
+                    $this->releaseLock($page->id, $clientId);
+                    $this->json(['ok' => true, 'released' => true]);
+                    break;
+
+                case 'status':
+                    $row = $this->lockForPage($page->id);
+                    if(!$row) {
+                        $this->json(['ok' => true, 'locked' => false]);
+                        break;
+                    }
+                    $mine = (int)$row['user_id'] === (int)$this->wire('user')->id && hash_equals($row['client_id'], $clientId);
+                    $this->json([
+                        'ok' => true,
+                        'locked' => true,
+                        'mine' => $mine,
+                        'user' => $row['user_name'] ?: 'Unbekannter Benutzer',
+                        'last_seen' => $row['last_seen'],
+                    ]);
+                    break;
+
+                default:
+                    $this->json(['ok' => false, 'error' => 'unknown_action'], 400);
+                    break;
+            }
+        } catch(\Throwable $e) {
+            // Log the real cause server-side (e.g. a DB error) instead of leaking
+            // it to the client, and always answer with parseable JSON so the
+            // frontend never has to guess why fetch()/r.json() failed.
+            $this->wire('log')->save('errors', 'PageEditLock ajax error: ' . $e->getMessage());
+            $this->json(['ok' => false, 'error' => 'server_error'], 500);
+        }
+        exit;
+    }
+
+    protected function resultPayload($result) {
+        if(!$result || empty($result['ok'])) {
+            $row = $result['row'] ?? null;
+            return [
+                'ok' => true,
+                'locked' => true,
+                'mine' => false,
+                'user' => $row && !empty($row['user_name']) ? $row['user_name'] : 'ein anderer Benutzer',
+                'last_seen' => $row['last_seen'] ?? null,
+            ];
+        }
+        return [
+            'ok' => true,
+            'locked' => false,
+            'mine' => true,
+            'user' => $this->wire('user')->name,
+        ];
+    }
+
+    public function hookExecute(HookEvent $event) {
+        if($this->ajaxRequest()) {
+            $this->ajaxEndpoint();
+        }
+    }
+
+    public function hookBuildFormContent(HookEvent $event) {
+        $page = $this->getPageFromEditProcess();
+        if(!$page || !$this->isEnabledForPage($page)) return;
+
+        $wrapper = $event->return;
+        $script = $this->renderAdminScript($page);
+        if($script) {
+            $wrapper->prependMarkup($script);
+        }
+    }
+
+    protected function renderAdminScript(Page $page) {
+        $clientStorageKey = 'PageEditLockClientId';
+        $pageId = (int)$page->id;
+        $heartbeat = max(5, (int)$this->get('heartbeat', 20));
+        $timeout = max(30, (int)$this->get('timeout', 120));
+        // Must include the page id: without it, ProcessPageEdit redirects (302) to
+        // the page list before our hook ever runs, and the ajax request never gets
+        // a JSON response.
+        $endpoint = $this->wire('input')->url() . '?id=' . $pageId . '&PageEditLock=1';
+
+        return '<div id="PageEditLockStatus" class="PageEditLockStatus" hidden></div>
+<style>
+.PageEditLockStatus{margin:0 0 15px;padding:12px 15px;border:1px solid #e0a000;border-radius:3px;background:#fff8dc;font-weight:600}
+.PageEditLockStatus.PageEditLockError{border-color:#d33;background:#fff0f0}
+.PageEditLockStatus.PageEditLockOk{border-color:#70a070;background:#f2fff2;font-weight:400}
+.PageEditLockDisabled{opacity:.55!important;pointer-events:none!important}
+</style>
+<script>
+(function() {
+    "use strict";
+    var pageId = ' . $pageId . ';
+    var heartbeatMs = ' . ($heartbeat * 1000) . ';
+    var timeoutSeconds = ' . $timeout . ';
+    var storageKey = ' . json_encode($clientStorageKey) . ';
+    var endpoint = ' . json_encode($endpoint) . ';
+    var statusEl = document.getElementById("PageEditLockStatus");
+    var form = document.querySelector("#ProcessPageEditView form") || document.querySelector("form#ProcessPageEditView") || document.querySelector("form");
+    var locked = false;
+    var released = false;
+    var timer = null;
+
+    function uuid32() {
+        if (window.crypto && crypto.getRandomValues) {
+            var a = new Uint8Array(16);
+            crypto.getRandomValues(a);
+            return Array.prototype.map.call(a, function(x){ return ("0"+x.toString(16)).slice(-2); }).join("");
+        }
+        return ("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx").replace(/x/g, function(){return Math.floor(Math.random()*16).toString(16);});
+    }
+
+    var clientId = "";
+    try { clientId = sessionStorage.getItem(storageKey) || ""; } catch(e) {}
+    if(!/^[a-f0-9]{32}$/.test(clientId)) {
+        clientId = uuid32();
+        try { sessionStorage.setItem(storageKey, clientId); } catch(e) {}
+    }
+
+    function show(text, error, ok) {
+        if(!statusEl) return;
+        statusEl.hidden = false;
+        statusEl.className = "PageEditLockStatus" + (error ? " PageEditLockError" : "") + (ok ? " PageEditLockOk" : "");
+        statusEl.textContent = text;
+    }
+
+    function disableEditor() {
+        locked = true;
+        if(form) {
+            Array.prototype.forEach.call(form.querySelectorAll("input,textarea,select,button"), function(el) {
+                if(el.name === "PageEditLock" || el.type === "hidden") return;
+                el.disabled = true;
+            });
+            form.classList.add("PageEditLockDisabled");
+        }
+    }
+
+    function enableEditor() {
+        locked = false;
+        if(form) {
+            Array.prototype.forEach.call(form.querySelectorAll("input,textarea,select,button"), function(el) {
+                el.disabled = false;
+            });
+            form.classList.remove("PageEditLockDisabled");
+        }
+    }
+
+    function request(action) {
+        var body = new URLSearchParams();
+        body.set("PageEditLock", "1");
+        body.set("action", action);
+        body.set("page_id", pageId);
+        body.set("client_id", clientId);
+        return fetch(endpoint, {
+            method: "POST",
+            credentials: "same-origin",
+            headers: {"X-Requested-With":"XMLHttpRequest","Content-Type":"application/x-www-form-urlencoded; charset=UTF-8"},
+            body: body.toString(),
+            cache: "no-store"
+        }).then(function(r) {
+            if(!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+        });
+    }
+
+    function handle(data, action) {
+        if(!data || data.ok !== true) {
+            show("Die Bearbeitungssperre konnte nicht geprüft werden. Bitte lade die Seite neu, bevor du speicherst.", true, false);
+            disableEditor();
+            return;
+        }
+
+        if(data.mine) {
+            enableEditor();
+            if(action === "claim" || action === "heartbeat") {
+                statusEl.hidden = true;
+            }
+            return;
+        }
+
+        if(data.locked) {
+            show("Diese Seite wird gerade von " + (data.user || "einem anderen Benutzer") + " bearbeitet. Deine Bearbeitung wurde deshalb gesperrt.", true, false);
+            disableEditor();
+        } else {
+            show("Die Bearbeitungssperre ist abgelaufen. Bitte lade die Seite neu, bevor du weiterarbeitest.", true, false);
+            disableEditor();
+        }
+    }
+
+    function claim() {
+        request("claim").then(function(data){ handle(data, "claim"); })
+        .catch(function(){ show("Die Bearbeitungssperre konnte nicht erreicht werden. Bitte lade die Seite neu, bevor du speicherst.", true, false); disableEditor(); });
+    }
+
+    function heartbeat() {
+        if(released) return;
+        request("heartbeat").then(function(data){ handle(data, "heartbeat"); })
+        .catch(function(){ /* transient network failure: do not immediately unlock; next heartbeat retries */ });
+    }
+
+    function checkOnReturn() {
+        if(released) return;
+        request("heartbeat").then(function(data){
+            if(data && data.mine) {
+                enableEditor();
+                statusEl.hidden = true;
+            } else {
+                handle(data, "return");
+            }
+        }).catch(function(){
+            show("Die Verbindung zum Server konnte nach dem Wechsel zurück in den Tab nicht geprüft werden. Bitte lade die Seite neu, bevor du speicherst.", true, false);
+            disableEditor();
+        });
+    }
+
+    window.addEventListener("beforeunload", function() {
+        if(released) return;
+        // Best-effort only. The server timeout remains the authoritative fallback.
+        try {
+            var body = new URLSearchParams();
+            body.set("PageEditLock", "1");
+            body.set("action", "release");
+            body.set("page_id", pageId);
+            body.set("client_id", clientId);
+            if(navigator.sendBeacon) navigator.sendBeacon(endpoint, body);
+        } catch(e) {}
+    });
+
+    document.addEventListener("visibilitychange", function() {
+        if(document.visibilityState === "visible") checkOnReturn();
+    });
+
+    // Prevent normal form submission if the lock was lost.
+    if(form) {
+        form.addEventListener("submit", function(e) {
+            if(locked) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                show("Speichern wurde verhindert, weil diese Seite nicht mehr von dir gesperrt ist. Bitte lade die Seite neu.", true, false);
+                return false;
+            }
+        }, true);
+    }
+
+    claim();
+    timer = window.setInterval(heartbeat, heartbeatMs);
+})();
+</script>';
+    }
+
+    protected function currentDbModified(Page $page) {
+        $stmt = $this->wire('database')->prepare("SELECT `modified` FROM `pages` WHERE `id` = :id LIMIT 1");
+        $stmt->execute([':id' => (int)$page->id]);
+        $value = $stmt->fetchColumn();
+        return $value !== false ? (string)$value : '';
+    }
+
+    protected function assertPageUnchangedSinceLock(Page $page, $clientId) {
+        $row = $this->lockForPage($page->id);
+        if(!$row) {
+            throw new WireException(
+                'PageEditLock: Speichern verhindert. Die Bearbeitungssperre ist abgelaufen oder wurde übernommen. Bitte Seite neu laden.'
+            );
+        }
+
+        if((int)$row['user_id'] !== (int)$this->wire('user')->id || !hash_equals($row['client_id'], $clientId)) {
+            throw new WireException(
+                'PageEditLock: Speichern verhindert. Diese Seite wird inzwischen von einem anderen Benutzer bearbeitet.'
+            );
+        }
+
+        $currentModified = $this->currentDbModified($page);
+        $baseModified = (string)($row['base_modified'] ?? '');
+
+        // If no baseline exists (old lock created before migration), allow this save
+        // and establish the baseline after it succeeds.
+        if($baseModified !== '' && $currentModified !== '' && $currentModified !== $baseModified) {
+            throw new WireException(
+                'PageEditLock: Speichern verhindert. Die Seite wurde inzwischen von einem anderen Benutzer geändert. Bitte Seite neu laden, um diese Änderungen nicht zu überschreiben.'
+            );
+        }
+    }
+
+    public function hookAjaxSave(HookEvent $event) {
+        $page = $event->arguments(0);
+        if(!$page instanceof Page || !$this->isEnabledForPage($page)) return;
+
+        $clientId = $this->clientId();
+        if(!$clientId) {
+            throw new WireException('PageEditLock: Speichern verhindert. Bitte Seite neu laden.');
+        }
+        $this->assertPageUnchangedSinceLock($page, $clientId);
+    }
+
+    public function hookProcessSubmitAction(HookEvent $event) {
+        $page = $this->getPageFromEditProcess();
+        if(!$page || !$this->isEnabledForPage($page)) return;
+
+        $clientId = $this->clientId();
+        if(!$clientId) {
+            throw new WireException('PageEditLock: Speichern verhindert. Bitte Seite neu laden.');
+        }
+        $this->assertPageUnchangedSinceLock($page, $clientId);
+    }
+
+    public function hookPageSaved(HookEvent $event) {
+        $page = $event->object;
+        if(!$page instanceof Page || !$this->isEnabledForPage($page)) return;
+
+        $clientId = $this->clientId();
+        if(!$clientId || !$this->ownLock($page->id, $clientId)) return;
+
+        $stmt = $this->wire('database')->prepare(
+            "UPDATE `" . self::TABLE . "`
+             SET base_modified = :modified, last_seen = NOW()
+             WHERE page_id = :page_id AND user_id = :user_id AND client_id = :client_id"
+        );
+        $stmt->execute([
+            ':modified' => $page->modified ?: null,
+            ':page_id' => (int)$page->id,
+            ':user_id' => (int)$this->wire('user')->id,
+            ':client_id' => $clientId,
+        ]);
+    }
+
+    public function hookPageSaveReady(HookEvent $event) {
+        $page = $event->object;
+        if(!$page instanceof Page || !$this->isEnabledForPage($page)) return;
+
+        // Page::saveReady() is also used outside PageEdit. Only enforce the lock when
+        // this request is clearly a PageEdit request.
+        if(!$this->wire('process') instanceof ProcessPageEdit) return;
+
+        $clientId = $this->clientId();
+        if(!$clientId) {
+            throw new WireException('PageEditLock: Speichern verhindert. Bitte Seite neu laden.');
+        }
+        $this->assertPageUnchangedSinceLock($page, $clientId);
+    }
+}
